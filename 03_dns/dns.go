@@ -107,7 +107,73 @@ func uint32IPtoString(address uint32) string {
 }
 
 func readDNSName(message []byte, start int) (string, int, error) {
-	
+	var labels []string
+
+	cursor := start
+	nextOffset := -1
+	visited := make(map[int]bool)
+
+	for {
+		if cursor < 0 || cursor >= len(message) {
+			return "", 0, fmt.Errorf("DNS name exceeds message size")
+		}
+
+		if visited[cursor] {
+			return "", 0, fmt.Errorf("DNS compression pointer loop")
+		}
+		visited[cursor] = true
+
+		currentByte := message[cursor]
+
+		if currentByte == 0 {
+			if nextOffset == -1 {
+				nextOffset = cursor + 1
+			}
+
+			if len(labels) == 0 {
+				return ".", nextOffset, nil
+			}
+
+			return strings.Join(labels, ".") + ".", nextOffset, nil
+		}
+
+		if currentByte&0xc0 == 0xc0 {
+			if cursor+2 > len(message) {
+				return "", 0, fmt.Errorf("incomplete DNS compression pointer")
+			}
+
+			pointer := binary.BigEndian.Uint16(
+				message[cursor : cursor+2],
+			)
+			pointer &= 0x3fff
+
+			if int(pointer) >= len(message) {
+				return "", 0, fmt.Errorf("DNS pointer exceeds message size")
+			}
+
+			if nextOffset == -1 {
+				nextOffset = cursor + 2
+			}
+
+			cursor = int(pointer)
+			continue
+		}
+
+		if currentByte&0xc0 != 0 {
+			return "", 0, fmt.Errorf("unsupported DNS label type")
+		}
+
+		labelLength := int(currentByte)
+		labelStart := cursor + 1
+		labelEnd := labelStart + labelLength
+
+		if labelEnd > len(message) {
+			return "", 0, fmt.Errorf("DNS label exceeds message size")
+		}
+
+		labels = append(labels, string(message[labelStart:labelEnd]))
+		cursor = labelEnd
+	}
 }
 
 func parseDNSResponse(messageID uint16, response []byte) (string, byte, error){
@@ -118,19 +184,42 @@ func parseDNSResponse(messageID uint16, response []byte) (string, byte, error){
 
 	headerInd := 12
 
-	qEnd := readDNSName(response, headerInd)
-	
-	tp := binary.BigEndian.Uint16(response[qEnd+2:qEnd+4])
+	_, questionNameEnd, err := readDNSName(response, headerInd)
+	if err != nil {
+		return "", 0, err
+	}
+
+	answerStart := questionNameEnd + 4 // QTYPE + QCLASS
+
+	_, fieldsStart, err := readDNSName(response, answerStart)
+	if err != nil {
+		return "", 0, err
+	}
+
+	if fieldsStart+10 > len(response) {
+	return "", 0, fmt.Errorf("incomplete DNS resource record")
+}
+
+	tp := binary.BigEndian.Uint16(
+		response[fieldsStart : fieldsStart+2],
+	)
 	typeName := typeNames[tp]
 
-	// ttl := binary.BigEndian.Uint32(response[qEnd+6:qEnd+8])
+	// ttl := binary.BigEndian.Uint32(
+	// 	response[fieldsStart+4 : fieldsStart+8],
+	// )
 
-	rdlength := binary.BigEndian.Uint16(response[qEnd+10:qEnd+12])
-	rdataStart := qEnd + 12
+	rdlength := binary.BigEndian.Uint16(
+		response[fieldsStart+8 : fieldsStart+10],
+	)
+
+	rdataStart := fieldsStart + 10
 	rdataEnd := rdataStart + int(rdlength)
+
 	if rdataEnd > len(response) {
 		return "", 0, fmt.Errorf("RDATA exceeds response size")
 	}
+
 	rdata := response[rdataStart:rdataEnd]
 
 	if typeName == "A" {
